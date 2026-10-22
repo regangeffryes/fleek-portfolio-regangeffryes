@@ -98,3 +98,13 @@ For a production book of 30,000+ accounts, use a managed persistent database, ad
 - `segmentation.py` — behavioural segments and feature-nudge selection.
 - `recommendations.py` — priorities, explanations and draft outreach.
 - `tests/test_processing.py` — core ingestion regression tests.
+
+## Editing outreach and priority colours
+
+In **Action queue**, select an account, edit the outreach message, then click **Save action & draft**. Edits are stored in the local SQLite database against account ID and recommended action. Changing the underlying recommended action creates a new draft context. The message is not sent. Priority cells are shaded red (P1), amber (P2), or green (P3). Hosted Streamlit Community Cloud local SQLite storage is **not durable** across restarts; use a managed database for production.
+
+## Updating an existing GitHub deployment (October 2026)
+
+Replace these files in your existing repository: `app.py`, `data_processing.py`, and add `status_display.py`. If your deployed app already has the editable-draft update, only `app.py` and `status_display.py` are required. GitHub web UI: open a file, click the pencil icon, replace contents, then click Commit changes. For a new file, choose Add file → Create new file and paste its contents. Alternatively, upload all updated project files via Add file → Upload files, replacing matching names when prompted. Keep the original workbook private.
+
+The Action queue now includes an editable colour-coded status dropdown in the table. Changes are saved when you click **Save status changes**. The lower editor saves customised outreach drafts and action notes. SQLite data on Streamlit Community Cloud is not durable across restarts.

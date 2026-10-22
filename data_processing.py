@@ -49,6 +49,10 @@ def _connect():
             PRIMARY KEY (account_id, action_key)
         )
     """)
+    # Existing demo databases are migrated without losing saved action states.
+    cols = {r[1] for r in con.execute("PRAGMA table_info(action_state)").fetchall()}
+    if "draft_override" not in cols:
+        con.execute("ALTER TABLE action_state ADD COLUMN draft_override TEXT")
     con.execute("""
         CREATE TABLE IF NOT EXISTS import_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -226,25 +230,26 @@ def get_action_state(account_id, action_key):
     con = _connect()
     try:
         row = con.execute(
-            "SELECT status,note,updated_at FROM action_state WHERE account_id=? AND action_key=?",
+            "SELECT status,note,draft_override,updated_at FROM action_state WHERE account_id=? AND action_key=?",
             (str(account_id), str(action_key))
         ).fetchone()
         if row is None:
-            return {"status": "Pending", "note": "", "updated_at": None}
+            return {"status": "Pending", "note": "", "draft_override": None, "updated_at": None}
         return dict(row)
     finally:
         con.close()
 
-def save_action_state(account_id, action_key, status, note=""):
+def save_action_state(account_id, action_key, status, note="", draft_override=None):
     now = datetime.now(timezone.utc).isoformat()
     con = _connect()
     try:
         with con:
             con.execute("""
-                INSERT INTO action_state(account_id,action_key,status,note,updated_at)
-                VALUES(?,?,?,?,?)
+                INSERT INTO action_state(account_id,action_key,status,note,updated_at,draft_override)
+                VALUES(?,?,?,?,?,?)
                 ON CONFLICT(account_id,action_key) DO UPDATE SET
-                    status=excluded.status, note=excluded.note, updated_at=excluded.updated_at
-            """, (str(account_id), str(action_key), str(status), str(note), now))
+                    status=excluded.status, note=excluded.note,
+                    draft_override=excluded.draft_override, updated_at=excluded.updated_at
+            """, (str(account_id), str(action_key), str(status), str(note), now, draft_override))
     finally:
         con.close()

@@ -9,6 +9,7 @@ from data_processing import (
 )
 from segmentation import add_segments
 from recommendations import add_recommendations
+from status_display import STATUS_OPTIONS, show_status, parse_status
 
 st.set_page_config(page_title="Fleek Portfolio Copilot", page_icon="🧵", layout="wide")
 
@@ -40,7 +41,14 @@ def money(value):
 
 def show_table(df, columns):
     available = [c for c in columns if c in df.columns]
-    st.dataframe(df[available], use_container_width=True, hide_index=True)
+    view = df[available].copy()
+    if "priority" in view.columns:
+        def priority_colour(value):
+            palette = {"P1": "#f8caca", "P2": "#fff0bd", "P3": "#d7f0df"}
+            return f"background-color: {palette[value]}; color: #202020" if value in palette else ""
+        st.dataframe(view.style.map(priority_colour, subset=["priority"]), use_container_width=True, hide_index=True)
+    else:
+        st.dataframe(view, use_container_width=True, hide_index=True)
 
 df = portfolio_frame()
 
@@ -169,8 +177,39 @@ with tab_actions:
         if selected_status != "All":
             queue = queue[queue["action_status"] == selected_status]
         queue = queue.sort_values(["priority_rank", "gmv_total_6m"], ascending=[True, False])
+        st.caption("Priority: 🔴 P1 = urgent, 🟡 P2 = follow up, 🟢 P3 = routine. These are decision-support flags, not guaranteed outcomes.")
         st.write(f"{len(queue)} actions match your filters.")
-        show_table(queue, ["account_id", "segment", "priority", "gmv_total_6m", "recommended_action", "recommended_feature", "reason", "action_status"])
+        st.markdown("**Edit action statuses in the table**")
+        st.caption("Click any cell under Action status, choose a colour-coded option, then click Save status changes. Draft messages are edited below.")
+        editor_cols = ["account_id", "segment", "priority", "gmv_total_6m", "recommended_action", "recommended_feature", "reason", "action_status"]
+        editor_view = queue[editor_cols].copy().reset_index(drop=True)
+        editor_view["priority"] = editor_view["priority"].map({"P1": "🔴 P1 — High", "P2": "🟡 P2 — Medium", "P3": "🟢 P3 — Low"}).fillna(editor_view["priority"])
+        editor_view["action_status"] = editor_view["action_status"].map(show_status)
+        edited_queue = st.data_editor(
+            editor_view,
+            use_container_width=True,
+            hide_index=True,
+            key="queue_status_editor",
+            disabled=[c for c in editor_cols if c != "action_status"],
+            column_config={
+                "action_status": st.column_config.SelectboxColumn("Action status", options=STATUS_OPTIONS, required=True, width="medium"),
+                "priority": st.column_config.TextColumn("Priority", width="medium"),
+                "reason": st.column_config.TextColumn("Reason", width="large"),
+            },
+        )
+        changed = edited_queue["action_status"].ne(editor_view["action_status"])
+        st.caption(f"{int(changed.sum())} unsaved status change(s).")
+        if st.button("Save status changes", type="primary", disabled=not changed.any()):
+            for i in edited_queue.index[changed]:
+                original = queue.iloc[int(i)]
+                current = get_action_state(original["account_id"], original["action_key"])
+                save_action_state(
+                    original["account_id"], original["action_key"],
+                    parse_status(edited_queue.at[i, "action_status"]),
+                    current.get("note", ""), current.get("draft_override"),
+                )
+            st.success(f"Saved {int(changed.sum())} action status update(s).")
+            st.rerun()
         st.divider()
         st.markdown("**Review an account action**")
         account_ids = queue["account_id"].astype(str).tolist()
@@ -180,14 +219,25 @@ with tab_actions:
             current_state = get_action_state(selected_id, selected_row["action_key"])
             st.markdown(f"**{selected_row['recommended_action']}**")
             st.write(selected_row["reason"])
-            st.text_area("Draft outreach / call note", value=str(selected_row["draft_outreach"]), height=150, key=f"draft_{selected_id}")
-            status_options = ["Pending", "In progress", "Completed", "Needs review"]
+            st.caption("Edit this draft for the customer. Your changes are saved only when you click Save action & draft; no message is sent.")
+            draft_key = f"draft_{selected_id}_{selected_row['action_key']}"
+            # A different account/action gets its own editor, preserving unsaved edits during reruns.
+            if draft_key not in st.session_state:
+                st.session_state[draft_key] = (current_state.get("draft_override")
+                    if current_state.get("draft_override") is not None
+                    else str(selected_row["draft_outreach"]))
+            edited_draft = st.text_area("Editable outreach message", height=170, key=draft_key)
+            if st.button("Show text to copy"):
+                st.code(edited_draft, language=None)
+                st.info("Select and copy the message above. It has not been sent.")
             current_status = current_state.get("status", "Pending")
-            new_status = st.selectbox("Action status", status_options, index=status_options.index(current_status) if current_status in status_options else 0, key=f"status_{selected_id}")
+            current_label = show_status(current_status)
+            new_status_label = st.selectbox("Action status", STATUS_OPTIONS, index=STATUS_OPTIONS.index(current_label), key=f"status_{selected_id}_{selected_row['action_key']}")
+            new_status = parse_status(new_status_label)
             note = st.text_input("Internal note (optional)", value=current_state.get("note", ""), key=f"note_{selected_id}")
-            if st.button("Save action status", type="primary"):
-                save_action_state(selected_id, selected_row["action_key"], new_status, note)
-                st.success("Action state saved.")
+            if st.button("Save action & draft", type="primary"):
+                save_action_state(selected_id, selected_row["action_key"], new_status, note, edited_draft)
+                st.success("Action status and edited message saved.")
                 st.rerun()
         else:
             st.info("No accounts match the selected filters.")
@@ -212,7 +262,9 @@ with tab_method:
 - Blank values remain missing; they are not silently treated as zero.
 - Missing trend is not automatically interpreted as a decline.
 - Recommendations are rules-based and explainable; they are not claims of causal impact.
-- Draft messages are not sent automatically.
+- Draft messages are not sent automatically. An account manager can edit and save a message in the Action queue.
+- Action statuses are editable in the queue table with colour-coded dropdown choices; click Save status changes to persist them.
+- Saved drafts and action statuses use local SQLite storage; Streamlit Community Cloud restarts can erase this data.
 - The supplied workbook is real anonymised data: do not publish it in a public repository.
 
 **Scale**
