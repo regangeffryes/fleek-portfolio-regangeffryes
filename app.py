@@ -1,5 +1,6 @@
 import io
 import pandas as pd
+import altair as alt
 import streamlit as st
 
 from data_processing import (
@@ -39,16 +40,76 @@ def money(value):
         return "—"
     return f"£{value:,.0f}"
 
+def format_numeric_table(view):
+    """Render raw percentage-point values as whole percentages; other numbers as integers."""
+    formats = {}
+    for col in view.columns:
+        if pd.api.types.is_numeric_dtype(view[col]) and not pd.api.types.is_bool_dtype(view[col]):
+            formats[col] = "{:.0f}%" if col.endswith("_pct") else "{:,.0f}"
+    return formats
+
+
 def show_table(df, columns):
     available = [c for c in columns if c in df.columns]
     view = df[available].copy()
+    styled = view.style.format(format_numeric_table(view), na_rep="—")
     if "priority" in view.columns:
         def priority_colour(value):
             palette = {"P1": "#f8caca", "P2": "#fff0bd", "P3": "#d7f0df"}
             return f"background-color: {palette[value]}; color: #202020" if value in palette else ""
-        st.dataframe(view.style.map(priority_colour, subset=["priority"]), use_container_width=True, hide_index=True)
-    else:
-        st.dataframe(view, use_container_width=True, hide_index=True)
+        styled = styled.map(priority_colour, subset=["priority"])
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
+def monthly_trend_chart(accounts):
+    """Show portfolio GMV and sequential month-on-month change in percentage points."""
+    month_cols = [("Sep", "gmv_sep"), ("Oct", "gmv_oct"), ("Nov", "gmv_nov"),
+                  ("Dec", "gmv_dec"), ("Jan", "gmv_jan"), ("Feb", "gmv_feb")]
+    rows = []
+    for idx, (month, col) in enumerate(month_cols):
+        vals = pd.to_numeric(accounts[col], errors="coerce")
+        rows.append({"month": month, "order": idx, "gmv": float(vals.sum(min_count=1)),
+                     "accounts_reporting": int(vals.notna().sum())})
+    monthly = pd.DataFrame(rows)
+    monthly["mom_pct"] = (monthly["gmv"] / monthly["gmv"].shift(1) - 1) * 100
+    monthly.loc[monthly["gmv"].shift(1).eq(0), "mom_pct"] = float("nan")
+    monthly["direction"] = monthly["mom_pct"].apply(
+        lambda x: "No comparison" if pd.isna(x) else
+        ("Increasing" if x > 0.5 else "Decreasing" if x < -0.5 else "Stagnant"))
+    st.markdown("**Monthly portfolio GMV**")
+    st.bar_chart(monthly.set_index("month")["gmv"], x_label="Month", y_label="GMV (£)")
+    st.markdown("**Month-on-month GMV change (%)**")
+    st.caption("Green = increase, red = decrease, yellow = broadly unchanged (within ±0.5%). September has no prior month for comparison.")
+    valid = monthly.dropna(subset=["mom_pct"]).copy()
+    if not valid.empty:
+        colors = alt.Scale(domain=["Increasing", "Decreasing", "Stagnant"],
+                           range=["#18864b", "#d13e3e", "#d5a900"])
+        # Each segment is coloured by the change at its ending month.
+        segments = []
+        for idx in range(1, len(valid)):
+            previous, current = valid.iloc[idx - 1], valid.iloc[idx]
+            for point in (previous, current):
+                segments.append({"segment": idx, "month": point["month"],
+                                 "order": int(point["order"]), "mom_pct": point["mom_pct"],
+                                 "direction": current["direction"]})
+        base = alt.Chart(valid).encode(
+            x=alt.X("month:N", sort=["Sep", "Oct", "Nov", "Dec", "Jan", "Feb"], title="Month"),
+            y=alt.Y("mom_pct:Q", title="MoM change (%)", axis=alt.Axis(format=".0f")),
+        )
+        points = base.mark_circle(size=110).encode(
+            color=alt.Color("direction:N", scale=colors, title="Change"),
+            tooltip=[alt.Tooltip("month:N", title="Month"),
+                     alt.Tooltip("mom_pct:Q", title="MoM change", format="+.0f"),
+                     alt.Tooltip("direction:N", title="Direction")])
+        layers = []
+        if segments:
+            layers.append(alt.Chart(pd.DataFrame(segments)).mark_line(strokeWidth=3).encode(
+                x=alt.X("month:N", sort=["Sep", "Oct", "Nov", "Dec", "Jan", "Feb"]),
+                y="mom_pct:Q", detail="segment:N", color=alt.Color("direction:N", scale=colors)))
+        st.altair_chart(alt.layer(*layers, points).properties(height=280), use_container_width=True)
+    st.dataframe(monthly[["month", "gmv", "mom_pct"]].style.format(
+        {"gmv": "£{:,.0f}", "mom_pct": "{:+.0f}%"}, na_rep="—"),
+        use_container_width=True, hide_index=True)
 
 df = portfolio_frame()
 
@@ -112,6 +173,9 @@ with tab_overview:
             st.markdown("**GMV by segment**")
             gmv_segment = df.groupby("segment", dropna=False)["gmv_total_6m"].sum().sort_values(ascending=False)
             st.bar_chart(gmv_segment)
+        st.divider()
+        monthly_trend_chart(df)
+        st.divider()
         st.markdown("**Highest-priority actions**")
         top = df.sort_values(["priority_rank", "gmv_total_6m"], ascending=[True, False]).head(12)
         show_table(top, ["account_id", "ownership", "segment", "gmv_total_6m", "gmv_trend_pct", "priority", "recommended_action", "reason"])
@@ -195,6 +259,7 @@ with tab_actions:
                 "action_status": st.column_config.SelectboxColumn("Action status", options=STATUS_OPTIONS, required=True, width="medium"),
                 "priority": st.column_config.TextColumn("Priority", width="medium"),
                 "reason": st.column_config.TextColumn("Reason", width="large"),
+                "gmv_total_6m": st.column_config.NumberColumn("6-month GMV", format="£%.0f"),
             },
         )
         changed = edited_queue["action_status"].ne(editor_view["action_status"])
