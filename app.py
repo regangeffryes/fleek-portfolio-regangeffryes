@@ -1,6 +1,7 @@
 import io
 import pandas as pd
 import streamlit as st
+import altair as alt
 
 from data_processing import (
     EXPECTED_COLUMNS, clean_accounts, read_workbook, ingest_accounts,
@@ -39,16 +40,83 @@ def money(value):
         return "—"
     return f"£{value:,.0f}"
 
-def show_table(df, columns):
-    available = [c for c in columns if c in df.columns]
-    view = df[available].copy()
+def display_format(column):
+    """Format numeric display only; calculations keep their original precision."""
+    if column.endswith("_pct"):
+        return "{:.0f}%"
+    if column.startswith("gmv_") or column in {"bundle_gmv", "gmv_display"}:
+        return "£{:,.0f}" if column != "gmv_display" else None
+    return "{:,.0f}"
+
+
+def format_table(view):
+    """Apply consistent display formatting to every numeric field."""
+    numeric_cols = [c for c in view.columns if pd.api.types.is_numeric_dtype(view[c])]
+    formats = {c: display_format(c) for c in numeric_cols}
+    formats = {c: f for c, f in formats.items() if f is not None}
+    styled = view.style.format(formats, na_rep="—")
     if "priority" in view.columns:
         def priority_colour(value):
             palette = {"P1": "#f8caca", "P2": "#fff0bd", "P3": "#d7f0df"}
             return f"background-color: {palette[value]}; color: #202020" if value in palette else ""
-        st.dataframe(view.style.map(priority_colour, subset=["priority"]), use_container_width=True, hide_index=True)
+        styled = styled.map(priority_colour, subset=["priority"])
+    return styled
+
+
+def show_table(df, columns):
+    available = [c for c in columns if c in df.columns]
+    st.dataframe(format_table(df[available].copy()), use_container_width=True, hide_index=True)
+
+
+def monthly_portfolio(frame):
+    fields = [("Sep", "gmv_sep"), ("Oct", "gmv_oct"), ("Nov", "gmv_nov"),
+              ("Dec", "gmv_dec"), ("Jan", "gmv_jan"), ("Feb", "gmv_feb")]
+    rows = []
+    for label, field in fields:
+        values = pd.to_numeric(frame[field], errors="coerce")
+        rows.append({"Month": label, "GMV": float(values.sum(min_count=1)) if values.notna().any() else float("nan")})
+    monthly = pd.DataFrame(rows)
+    monthly["Previous GMV"] = monthly["GMV"].shift(1)
+    # Month-over-month percentage is undefined when previous GMV is zero or missing.
+    monthly["MoM change %"] = ((monthly["GMV"] - monthly["Previous GMV"])
+                                / monthly["Previous GMV"].where(monthly["Previous GMV"] != 0) * 100)
+    monthly["Direction"] = monthly["MoM change %"].map(
+        lambda x: "No comparison" if pd.isna(x) else
+        ("Increasing" if x > 0.5 else "Decreasing" if x < -0.5 else "Stagnant"))
+    return monthly
+
+
+def show_monthly_graphs(monthly, prefix="portfolio"):
+    st.markdown("**Monthly GMV breakdown**")
+    plot = monthly.dropna(subset=["GMV"])
+    if plot.empty:
+        st.info("No monthly GMV data available.")
+        return
+    gmv_chart = (alt.Chart(plot).mark_line(point=True, strokeWidth=3)
+        .encode(x=alt.X("Month:N", sort=["Sep", "Oct", "Nov", "Dec", "Jan", "Feb"]),
+                y=alt.Y("GMV:Q", axis=alt.Axis(format="£,.0f")),
+                tooltip=["Month:N", alt.Tooltip("GMV:Q", format="£,.0f")]))
+    st.altair_chart(gmv_chart, use_container_width=True, key=f"{prefix}_monthly_gmv")
+    st.markdown("**Month-over-month GMV change**")
+    st.caption("Green = increasing (>0.5%); red = decreasing (<−0.5%); amber = stagnant (within ±0.5%). September has no prior month for comparison.")
+    changes = monthly.dropna(subset=["MoM change %"])
+    if changes.empty:
+        st.info("Not enough non-zero monthly GMV data to calculate month-over-month changes.")
     else:
-        st.dataframe(view, use_container_width=True, hide_index=True)
+        mom_chart = (alt.Chart(changes).mark_bar()
+            .encode(x=alt.X("Month:N", sort=["Sep", "Oct", "Nov", "Dec", "Jan", "Feb"]),
+                    y=alt.Y("MoM change %:Q", axis=alt.Axis(format=".0f", title="Change (%)")),
+                    color=alt.Color("Direction:N", scale=alt.Scale(
+                        domain=["Increasing", "Decreasing", "Stagnant"],
+                        range=["#15966d", "#d94b4b", "#e0a62e"]), legend=alt.Legend(title="GMV movement")),
+                    tooltip=["Month:N", alt.Tooltip("MoM change %:Q", format=".0f", title="MoM change (%)"), "Direction:N"]))
+        st.altair_chart(mom_chart, use_container_width=True, key=f"{prefix}_mom")
+    table = monthly[["Month", "GMV", "MoM change %", "Direction"]].copy()
+    st.dataframe(table.style.format({"GMV": "£{:,.0f}", "MoM change %": "{:+.0f}%"}, na_rep="—")
+                 .map(lambda v: "background-color: #d7f0df; color: #202020" if v == "Increasing" else
+                      "background-color: #f8caca; color: #202020" if v == "Decreasing" else
+                      "background-color: #fff0bd; color: #202020" if v == "Stagnant" else "", subset=["Direction"]),
+                 hide_index=True, use_container_width=True)
 
 df = portfolio_frame()
 
@@ -112,6 +180,9 @@ with tab_overview:
             st.markdown("**GMV by segment**")
             gmv_segment = df.groupby("segment", dropna=False)["gmv_total_6m"].sum().sort_values(ascending=False)
             st.bar_chart(gmv_segment)
+        st.divider()
+        show_monthly_graphs(monthly_portfolio(df), prefix="overview")
+        st.divider()
         st.markdown("**Highest-priority actions**")
         top = df.sort_values(["priority_rank", "gmv_total_6m"], ascending=[True, False]).head(12)
         show_table(top, ["account_id", "ownership", "segment", "gmv_total_6m", "gmv_trend_pct", "priority", "recommended_action", "reason"])
@@ -137,7 +208,7 @@ with tab_deep_dive:
 
         def metric_percent(field):
             value = number_for(field)
-            return "—" if pd.isna(value) else f"{value:,.1f}%"
+            return "—" if pd.isna(value) else f"{value:,.0f}%"
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("6-month GMV", money(number_for("gmv_total_6m")))
@@ -145,13 +216,8 @@ with tab_deep_dive:
         m3.metric("GMV trend", metric_percent("gmv_trend_pct"))
         m4.metric("Broker reliance", metric_percent("broker_reliance_pct"))
 
-        st.markdown("**Monthly GMV**")
-        monthly_fields = [("Sep", "gmv_sep"), ("Oct", "gmv_oct"), ("Nov", "gmv_nov"), ("Dec", "gmv_dec"), ("Jan", "gmv_jan"), ("Feb", "gmv_feb")]
-        monthly = pd.DataFrame([{"Month": label, "GMV": number_for(field)} for label, field in monthly_fields])
-        if monthly["GMV"].notna().any():
-            st.line_chart(monthly.set_index("Month"), y="GMV", use_container_width=True)
-        else:
-            st.info("No monthly GMV values available for this account.")
+        monthly = monthly_portfolio(pd.DataFrame([account]))
+        show_monthly_graphs(monthly, prefix="account")
 
         left, right = st.columns(2)
         with left:
@@ -195,9 +261,8 @@ with tab_migration:
         migration = df[df["segment"] == "Broker-reliant"].copy()
         st.write(f"**{len(migration)}** accounts meet the initial behavioural rule. Review the evidence before contacting customers.")
         if not migration.empty:
-            migration["gmv_display"] = migration["gmv_total_6m"].map(money)
             show_table(migration.sort_values(["priority_rank", "gmv_total_6m"], ascending=[True, False]), [
-                "account_id", "buyer_persona", "country", "gmv_display", "broker_reliance_pct",
+                "account_id", "buyer_persona", "country", "gmv_total_6m", "broker_reliance_pct",
                 "manual_orders", "app_active_days_6m", "pdp_views_6m", "make_an_offer_6m",
                 "priority", "reason", "recommended_action", "draft_outreach"
             ])
@@ -212,9 +277,8 @@ with tab_growth:
         growth = growth[growth["segment"] == "Self-serve growth opportunity"]
         st.write(f"**{len(growth)}** self-serve accounts currently meet the growth-opportunity rule.")
         if not growth.empty:
-            growth["gmv_display"] = growth["gmv_total_6m"].map(money)
             show_table(growth.sort_values(["priority_rank", "gmv_total_6m"], ascending=[True, False]), [
-                "account_id", "buyer_persona", "country", "gmv_display", "pdp_views_6m",
+                "account_id", "buyer_persona", "country", "gmv_total_6m", "pdp_views_6m",
                 "make_an_offer_6m", "chat_threads", "video_call_requests", "handpick_orders",
                 "bundle_orders", "recommended_feature", "priority", "reason", "draft_outreach"
             ])
@@ -266,6 +330,7 @@ with tab_actions:
                 "action_status": st.column_config.SelectboxColumn("Action status", options=STATUS_OPTIONS, required=True, width="medium"),
                 "priority": st.column_config.TextColumn("Priority", width="medium"),
                 "reason": st.column_config.TextColumn("Reason", width="large"),
+                "gmv_total_6m": st.column_config.NumberColumn("6-month GMV (£)", format="£%.0f"),
             },
         )
         changed = edited_queue["action_status"].ne(editor_view["action_status"])
