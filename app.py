@@ -92,10 +92,14 @@ def show_monthly_graphs(monthly, prefix="portfolio"):
     if plot.empty:
         st.info("No monthly GMV data available.")
         return
-    gmv_chart = (alt.Chart(plot).mark_line(point=True, strokeWidth=3)
-        .encode(x=alt.X("Month:N", sort=["Sep", "Oct", "Nov", "Dec", "Jan", "Feb"]),
-                y=alt.Y("GMV:Q", axis=alt.Axis(format="£,.0f")),
-                tooltip=["Month:N", alt.Tooltip("GMV:Q", format="£,.0f")]))
+    # Explicit bar chart with safe Vega number formatting and a formatted tooltip.
+    # A literal £ inside a D3 format specifier can prevent the chart from rendering.
+    plot = plot.copy()
+    plot["GMV label"] = plot["GMV"].map(lambda v: f"£{v:,.0f}")
+    gmv_chart = (alt.Chart(plot).mark_bar(color="#3273b9")
+        .encode(x=alt.X("Month:N", sort=["Sep", "Oct", "Nov", "Dec", "Jan", "Feb"], title="Month"),
+                y=alt.Y("GMV:Q", axis=alt.Axis(format=",.0f", title="GMV (£)"), scale=alt.Scale(zero=True)),
+                tooltip=[alt.Tooltip("Month:N"), alt.Tooltip("GMV label:N", title="GMV")]))
     st.altair_chart(gmv_chart, use_container_width=True, key=f"{prefix}_monthly_gmv")
     st.markdown("**Month-over-month GMV change**")
     st.caption("Green = increasing (>0.5%); red = decreasing (<−0.5%); amber = stagnant (within ±0.5%). September has no prior month for comparison.")
